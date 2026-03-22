@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小逗包</string>
+    <string name="session_list_title">选择会话</string>
+    <string name="chat_title">聊天</string>
+    <string name="message_hint">输入消息...</string>
+    <string name="send">发送</string>
+    <string name="failed_tag">发送失败</string>
+    <string name="log_button">📋 日志</string>
+    <string name="log_dialog_title">错误日志</string>
+    <string name="log_dialog_message_label">消息内容:</string>
+    <string name="log_dialog_error_label">错误详情:</string>
+    <string name="copy">复制</string>
+    <string name="close">关闭</string>
+    <string name="retry">重试</string>
+    <string name="retry_count">重试中 (%1$d/5)</string>
+    <string name="network_error">网络错误，请检查网络连接</string>
+    <string name="unknown_error">未知错误</string>
+    <string name="loading">加载中...</string>
+    <string name="no_messages">暂无消息，开始聊天吧</string>
+    <string name="copied">已复制到剪贴板</string>
+
+    <!-- Session names -->
+    <string name="session_health">健康</string>
+    <string name="session_legal">法律</string>
+    <string name="session_medical">医疗</string>
+    <string name="session_academic">学术</string>
+    <string name="session_programming">编程</string>
+    <string name="session_gaming">游戏</string>
+    <string name="session_english">英语</string>
+    <string name="session_social">社交</string>
+</resources>

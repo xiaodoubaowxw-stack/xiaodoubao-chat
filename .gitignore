@@ -1,0 +1,31 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Gradle files
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local configuration (should not be committed)
+local.properties
+
+# IntelliJ
+.idea/
+*.iml
+
+# Keystore
+*.jks
+*.keystore
+
+# Google Services (may contain API keys)
+google-services.json
+
+# Log files
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
