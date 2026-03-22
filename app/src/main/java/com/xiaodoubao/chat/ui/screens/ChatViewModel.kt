@@ -1,6 +1,7 @@
 package com.xiaodoubao.chat.ui.screens
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xiaodoubao.chat.data.local.MessageDataStore
@@ -8,6 +9,7 @@ import com.xiaodoubao.chat.data.model.Message
 import com.xiaodoubao.chat.data.model.SendResult
 import com.xiaodoubao.chat.data.model.Session
 import com.xiaodoubao.chat.data.repository.ChatRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -17,6 +19,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -24,6 +27,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val SERVER_URL = "http://124.156.194.65:5568"
         private const val USER_ID = "41DEFE0E0D9F56B1A5355E6EC9B5CDCA"
         private const val POLL_INTERVAL_MS = 3000L
+        private const val TAG = "ChatViewModel"
     }
 
     private val dataStore = MessageDataStore(application)
@@ -46,13 +50,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setSession(session: Session) {
         viewModelScope.launch {
-            _currentSession.value = session
-            _messages.value = emptyList()
-            lastMessageId = null
-            repository.getMessages(session.id).collectLatest { msgs ->
-                val filtered = msgs.filter { !it.isAck }
-                _messages.value = filtered
-                lastMessageId = filtered.lastOrNull()?.id
+            try {
+                _currentSession.value = session
+                _messages.value = emptyList()
+                lastMessageId = null
+                repository.getMessages(session.id).collectLatest { msgs ->
+                    val filtered = msgs.filter { msg -> !msg.isAck }
+                    _messages.value = filtered
+                    lastMessageId = filtered.lastOrNull()?.id
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading messages", e)
             }
         }
         startPolling(session.id)
@@ -62,100 +70,176 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         pollJob?.cancel()
         pollJob = viewModelScope.launch {
             while (true) {
-                delay(POLL_INTERVAL_MS)
-                val newMessages = repository.pollMessages(sessionId, lastMessageId)
-                if (newMessages.isNotEmpty()) {
-                    val filtered = newMessages.filter { !it.isAck }
-                    if (filtered.isNotEmpty()) {
-                        val currentMsgs = _messages.value.toMutableList()
-                        filtered.forEach { newMsg ->
-                            if (currentMsgs.none { it.id == newMsg.id }) {
-                                currentMsgs.add(newMsg)
-                                repository.appendMessage(sessionId, newMsg)
+                try {
+                    delay(POLL_INTERVAL_MS)
+                    val newMessages = repository.pollMessages(sessionId, lastMessageId)
+                    if (newMessages.isNotEmpty()) {
+                        val filtered = newMessages.filter { msg -> !msg.isAck }
+                        if (filtered.isNotEmpty()) {
+                            val currentMsgs = _messages.value.toMutableList()
+                            filtered.forEach { newMsg ->
+                                if (currentMsgs.none { it.id == newMsg.id }) {
+                                    currentMsgs.add(newMsg)
+                                }
                             }
+                            _messages.value = currentMsgs
+                            lastMessageId = currentMsgs.lastOrNull()?.id
                         }
-                        _messages.value = currentMsgs
-                        lastMessageId = currentMsgs.lastOrNull()?.id
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Polling error", e)
+                    delay(POLL_INTERVAL_MS)
                 }
             }
         }
     }
 
     fun sendMessage(text: String) {
+        if (text.isBlank()) return
+        if (_isSending.value) return
         val session = _currentSession.value ?: return
-        viewModelScope.launch {
-            _isSending.value = true
-            val userMessage = Message.userMessage(session.id, text)
-            repository.appendMessage(session.id, userMessage)
-            _messages.value = _messages.value + userMessage
 
-            repository.sendMessage(userMessage).collectLatest { result ->
-                when (result) {
-                    is SendResult.Success -> {
-                        val updated = _messages.value.map {
-                            if (it.id == userMessage.id) it.copy(id = result.messageId) else it
+        val userMessage = Message.userMessage(session.id, text)
+
+        // Update UI immediately on main thread
+        _messages.value = _messages.value + userMessage
+
+        viewModelScope.launch {
+            try {
+                _isSending.value = true
+                repository.sendMessage(userMessage).collectLatest { result ->
+                    when (result) {
+                        is SendResult.Success -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == userMessage.id }
+                            if (idx >= 0) {
+                                val updated = currentList[idx].copy(id = result.messageId)
+                                currentList[idx] = updated
+                                _messages.value = currentList
+                                lastMessageId = result.messageId
+                            }
+                            _isSending.value = false
                         }
-                        _messages.value = updated
-                        lastMessageId = result.messageId
-                        _isSending.value = false
-                    }
-                    is SendResult.Error -> {
-                        val updated = _messages.value.map {
-                            if (it.id == userMessage.id) it.copy(isFailed = true, errorDetail = result.error) else it
+                        is SendResult.Error -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == userMessage.id }
+                            if (idx >= 0) {
+                                val updated = currentList[idx].copy(
+                                    isFailed = true,
+                                    errorDetail = result.error,
+                                    retryCount = 0
+                                )
+                                currentList[idx] = updated
+                                _messages.value = currentList
+                            }
+                            withContext(Dispatchers.IO) {
+                                try {
+                                    repository.saveMessages(session.id, _messages.value)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Save error", e)
+                                }
+                            }
+                            _isSending.value = false
                         }
-                        _messages.value = updated
-                        repository.saveMessages(session.id, updated)
-                        _isSending.value = false
-                    }
-                    is SendResult.Retrying -> {
-                        val updated = _messages.value.map {
-                            if (it.id == userMessage.id) it.copy(retryCount = result.attempt) else it
+                        is SendResult.Retrying -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == userMessage.id }
+                            if (idx >= 0) {
+                                val updated = currentList[idx].copy(retryCount = result.attempt)
+                                currentList[idx] = updated
+                                _messages.value = currentList
+                            }
                         }
-                        _messages.value = updated
                     }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "sendMessage exception", e)
+                _isSending.value = false
+                val currentList = _messages.value.toMutableList()
+                val idx = currentList.indexOfFirst { it.id == userMessage.id }
+                if (idx >= 0) {
+                    currentList[idx] = currentList[idx].copy(isFailed = true, errorDetail = e.message)
+                    _messages.value = currentList
                 }
             }
         }
     }
 
     fun retryMessage(message: Message) {
+        if (_isSending.value) return
         val session = _currentSession.value ?: return
+
         viewModelScope.launch {
-            _isSending.value = true
-            repository.retryMessage(message).collectLatest { result ->
-                when (result) {
-                    is SendResult.Success -> {
-                        val updated = _messages.value.map {
-                            if (it.id == message.id) it.copy(isFailed = false, errorDetail = null, retryCount = 0, id = result.messageId) else it
+            try {
+                _isSending.value = true
+                repository.retryMessage(message).collectLatest { result ->
+                    when (result) {
+                        is SendResult.Success -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == message.id }
+                            if (idx >= 0) {
+                                currentList[idx] = currentList[idx].copy(
+                                    isFailed = false,
+                                    errorDetail = null,
+                                    retryCount = 0,
+                                    id = result.messageId
+                                )
+                                _messages.value = currentList
+                                lastMessageId = result.messageId
+                            }
+                            withContext(Dispatchers.IO) {
+                                try {
+                                    repository.saveMessages(session.id, _messages.value)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Save error", e)
+                                }
+                            }
+                            _isSending.value = false
                         }
-                        _messages.value = updated
-                        lastMessageId = result.messageId
-                        repository.saveMessages(session.id, updated)
-                        _isSending.value = false
-                    }
-                    is SendResult.Error -> {
-                        val updated = _messages.value.map {
-                            if (it.id == message.id) it.copy(isFailed = true, errorDetail = result.error, retryCount = 0) else it
+                        is SendResult.Error -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == message.id }
+                            if (idx >= 0) {
+                                currentList[idx] = currentList[idx].copy(
+                                    isFailed = true,
+                                    errorDetail = result.error,
+                                    retryCount = 0
+                                )
+                                _messages.value = currentList
+                            }
+                            withContext(Dispatchers.IO) {
+                                try {
+                                    repository.saveMessages(session.id, _messages.value)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Save error", e)
+                                }
+                            }
+                            _isSending.value = false
                         }
-                        _messages.value = updated
-                        repository.saveMessages(session.id, updated)
-                        _isSending.value = false
-                    }
-                    is SendResult.Retrying -> {
-                        val updated = _messages.value.map {
-                            if (it.id == message.id) it.copy(retryCount = result.attempt) else it
+                        is SendResult.Retrying -> {
+                            val currentList = _messages.value.toMutableList()
+                            val idx = currentList.indexOfFirst { it.id == message.id }
+                            if (idx >= 0) {
+                                currentList[idx] = currentList[idx].copy(retryCount = result.attempt)
+                                _messages.value = currentList
+                            }
                         }
-                        _messages.value = updated
                     }
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "retryMessage exception", e)
+                _isSending.value = false
             }
         }
     }
 
     fun showLogDialog(message: Message) {
         viewModelScope.launch {
-            _logDialogEvent.emit(message)
+            try {
+                _logDialogEvent.emit(message)
+            } catch (e: Exception) {
+                Log.e(TAG, "showLogDialog error", e)
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 package com.xiaodoubao.chat.data.repository
 
-
+import android.util.Log
 import com.xiaodoubao.chat.data.local.MessageDataStore
 import com.xiaodoubao.chat.data.model.Message
 import com.xiaodoubao.chat.data.model.SendResult
@@ -15,6 +15,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 class ChatRepository(
@@ -23,14 +25,16 @@ class ChatRepository(
     private val dataStore: MessageDataStore
 ) {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
         .build()
 
     companion object {
         private const val MAX_RETRIES = 5
         private val BASE_DELAY_MS = 800L
+        private const val TAG = "ChatRepository"
     }
 
     fun getMessages(sessionId: String): Flow<List<Message>> = dataStore.getMessages(sessionId)
@@ -69,8 +73,27 @@ class ChatRepository(
                     emit(SendResult.Retrying(message, attempt, delayMs))
                     delay(delayMs)
                 }
+            } catch (e: SocketTimeoutException) {
+                val error = "连接超时 (attempt $attempt)"
+                if (attempt >= MAX_RETRIES) {
+                    emit(SendResult.Error(message, error))
+                    return@flow
+                }
+                val delayMs = BASE_DELAY_MS * (1 shl (attempt - 1))
+                emit(SendResult.Retrying(message, attempt, delayMs))
+                delay(delayMs)
+            } catch (e: UnknownHostException) {
+                val error = "网络错误：无法连接服务器"
+                if (attempt >= MAX_RETRIES) {
+                    emit(SendResult.Error(message, error))
+                    return@flow
+                }
+                val delayMs = BASE_DELAY_MS * (1 shl (attempt - 1))
+                emit(SendResult.Retrying(message, attempt, delayMs))
+                delay(delayMs)
             } catch (e: Exception) {
-                val error = e.message ?: "Unknown error"
+                val error = e.message ?: "未知错误"
+                Log.e(TAG, "Send error attempt $attempt", e)
                 if (attempt >= MAX_RETRIES) {
                     emit(SendResult.Error(message, error))
                     return@flow
@@ -82,23 +105,18 @@ class ChatRepository(
         }
     }.flowOn(Dispatchers.IO)
 
-    suspend fun pollMessages(sessionId: String, afterMsgId: String?): List<Message> = withContext(Dispatchers.IO) {
+    fun retryMessage(message: Message): Flow<SendResult> = sendMessage(message)
+
+    suspend fun pollMessages(sessionId: String, afterId: String?): List<Message> = withContext(Dispatchers.IO) {
         try {
-            val url = if (afterMsgId != null) {
-                "$serverUrl/poll?id=$userId&after=$afterMsgId"
-            } else {
-                "$serverUrl/poll?id=$userId"
-            }
+            val after = afterId ?: "0"
+            val url = "$serverUrl/poll?id=$userId&session=$sessionId&after=$after"
             val request = Request.Builder().url(url).get().build()
             val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: ""
-
-            if (response.isSuccessful && body.isNotEmpty()) {
-                parsePollResponse(body, sessionId)
-            } else {
-                emptyList()
-            }
+            val body = response.body?.string() ?: "{\"messages\":[]}"
+            parsePollResponse(body, sessionId)
         } catch (e: Exception) {
+            Log.e(TAG, "pollMessages error", e)
             emptyList()
         }
     }
@@ -125,47 +143,8 @@ class ChatRepository(
                 }
             }
         } catch (e: Exception) {
+            Log.e(TAG, "parsePollResponse error", e)
             emptyList()
         }
     }
-
-    fun retryMessage(message: Message): Flow<SendResult> = flow {
-        val retriedMessage = message.copy(isFailed = false, errorDetail = null, retryCount = 0)
-        var attempt = 0
-        while (attempt < MAX_RETRIES) {
-            attempt++
-            try {
-                val encodedText = java.net.URLEncoder.encode(retriedMessage.text, "UTF-8")
-                val url = "$serverUrl/send?id=$userId&text=$encodedText&session=${retriedMessage.sessionId}"
-                val request = Request.Builder().url(url).get().build()
-                val response = client.newCall(request).execute()
-                val body = response.body?.string() ?: ""
-
-                if (response.isSuccessful && body.isNotEmpty()) {
-                    val json = JSONObject(body)
-                    val msgId = json.optString("id", retriedMessage.id)
-                    emit(SendResult.Success(msgId))
-                    return@flow
-                } else {
-                    val error = "HTTP ${response.code}: ${response.message}"
-                    if (attempt >= MAX_RETRIES) {
-                        emit(SendResult.Error(retriedMessage, error))
-                        return@flow
-                    }
-                    val delayMs = BASE_DELAY_MS * (1 shl (attempt - 1))
-                    emit(SendResult.Retrying(retriedMessage, attempt, delayMs))
-                    delay(delayMs)
-                }
-            } catch (e: Exception) {
-                val error = e.message ?: "Unknown error"
-                if (attempt >= MAX_RETRIES) {
-                    emit(SendResult.Error(retriedMessage, error))
-                    return@flow
-                }
-                val delayMs = BASE_DELAY_MS * (1 shl (attempt - 1))
-                emit(SendResult.Retrying(retriedMessage, attempt, delayMs))
-                delay(delayMs)
-            }
-        }
-    }.flowOn(Dispatchers.IO)
 }
